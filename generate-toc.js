@@ -1,200 +1,212 @@
 // generate-toc.js
-// Run with: deno run --allow-read --allow-write generate-index.js
+// Run with:
+//   deno run --allow-read --allow-write --allow-env generate-toc.js
+//
+// Examples:
+//   deno run -A generate-toc.js
+//   deno run -A generate-toc.js --no-global
+//
+// Exclude files:
+//   Global:  ~/.generate-toc-exclude
+//   Local:   ./.generate-toc-exclude
+//
+// Rules:
+//  - Lines starting with # are comments; blank lines are ignored
+//  - Globs supported (**, *, ?, [set]) via std/path.globToRegExp
+//  - Later rules override earlier ones
+//  - Prefix a rule with '!' to re-include (negate) a prior match
 
-import { walk } from 'jsr:@std/fs/walk'
+import { join, relative, posix, globToRegExp } from "jsr:@std/path";
 
-// ----- 1. Build a directory tree structure -----
-// We'll build a tree like:
-// {
-//   name: "",
-//   children: {
-//     "subdir": { name: "subdir", children: { ... }, files: ["a.txt", "b.md"] },
-//     ...
-//   },
-//   files: ["rootfile.txt", ...]
-// }
+const VERSION = "v0.1.0";
 
-function createNode(name = '') {
-  return {
-    name,
-    children: new Map(), // dirName -> node
-    files: [],           // [ "fileA.txt", ... ]
+// ---------------- CLI ----------------
+function parseArgs(args) {
+  const out = { noGlobal: false, root: "." };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--no-global") out.noGlobal = true;
+    else out.root = a;
   }
+  return out;
+}
+
+// ---------------- Exclude rules ----------------
+function readLinesIfExists(path) {
+  try {
+    return Deno.readTextFileSync(path).split(/\r?\n/);
+  } catch {
+    return [];
+  }
+}
+
+function loadExcludeRules({ noGlobal, rootDir }) {
+  const rules = [];
+
+  const localPath = join(rootDir, ".generate-toc-exclude");
+  const home = Deno.env.get("HOME") || Deno.env.get("USERPROFILE") || "";
+  const globalPath = home ? join(home, ".generate-toc-exclude") : "";
+
+  // Global first, unless disabled
+  if (!noGlobal && globalPath) {
+    for (const line of readLinesIfExists(globalPath)) {
+      const s = line.trim();
+      if (!s || s.startsWith("#")) continue;
+      rules.push(s);
+    }
+  }
+
+  // Local second (overrides by order)
+  for (const line of readLinesIfExists(localPath)) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    rules.push(s);
+  }
+
+  // Precompile to regex
+  const compiled = rules.map((rule) => {
+    const neg = rule.startsWith("!");
+    const pattern = neg ? rule.slice(1) : rule;
+    // Normalize all globs to POSIX-like paths for consistent matching
+    const rx = globToRegExp(pattern, { extended: true, globstar: true });
+    return { neg, rx, raw: rule };
+  });
+
+  return compiled;
+}
+
+// Decide if a path (relative to root) is included
+function isIncluded(relPath, compiledRules) {
+  // All matching happens on POSIX-ish paths (foo/bar)
+  const p = relPath.split("\\").join("/");
+
+  let include = true; // default: include
+  for (const { neg, rx } of compiledRules) {
+    if (rx.test(p)) {
+      include = neg ? true : false;
+    }
+  }
+  return include;
+}
+
+// ---------------- Tree building ----------------
+function createNode(name) {
+  return { name, children: new Map(), files: [] };
 }
 
 function insertPath(root, pathParts) {
-  // pathParts: ["dirA", "dirB", "file.txt"] or ["file.txt"]
-  if (pathParts.length === 0) return
-
+  if (pathParts.length === 0) return;
   if (pathParts.length === 1) {
-    // It's a file
-    root.files.push(pathParts[0])
-    return
+    root.files.push(pathParts[0]);
+    return;
   }
-
-  const [dir, ...rest] = pathParts
-  if (!root.children.has(dir)) {
-    root.children.set(dir, createNode(dir))
-  }
-  insertPath(root.children.get(dir), rest)
+  const [dir, ...rest] = pathParts;
+  if (!root.children.has(dir)) root.children.set(dir, createNode(dir));
+  insertPath(root.children.get(dir), rest);
 }
 
-// ----- 2. Walk the filesystem and populate the tree -----
+async function buildTree(rootDir, compiledRules) {
+  const root = createNode("");
 
-async function buildTree(rootDir = '.') {
-  const root = createNode('')
+  async function walkDir(absDir, relDir) {
+    for await (const entry of Deno.readDir(absDir)) {
+      const rel = relDir ? posix.join(relDir, entry.name) : entry.name;
 
-  for await (const entry of walk(rootDir, {
-    includeDirs: false,
-    includeSymlinks: false,
-    followSymlinks: false,
-  })) {
-    const relPath = entry.path.replace(/^[.][/]?/, '') // remove leading "./"
-    if (!relPath) continue
+      // If excluded, skip completely (no descend)
+      if (!isIncluded(rel, compiledRules)) continue;
 
-    // skip hidden files/dirs and this output file
-    if (
-      relPath === 'table-of-contents.html' ||
-      relPath.startsWith('.') ||
-      relPath.split('/').some(part => part.startsWith('.'))
-    ) {
-      continue
+      const abs = join(absDir, entry.name);
+      if (entry.isDirectory) {
+        // Insert the directory (only creates node when a child/file is inserted)
+        await walkDir(abs, rel);
+        // If the directory exists but had no children/files, nothing is inserted.
+      } else if (entry.isFile) {
+        insertPath(root, rel.split("/"));
+      }
+      // (symlinks are ignored)
     }
-
-    const parts = relPath.split('/')
-    insertPath(root, parts)
   }
 
-  return root
+  await walkDir(rootDir, "");
+  return root;
 }
 
-// ----- 3. Render the tree to nested <ul> HTML -----
-
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
+// ---------------- Render HTML ----------------
+function escapeHtml(s) {
+  return s
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
-// Returns HTML for a node's contents (directories first, then files)
-function renderNode(node, parentPath = '') {
-  let html = '<ul>\n'
+function renderNode(node, basePath) {
+  const dirs = [...node.children.values()].sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+  const files = [...node.files].sort((a, b) => a.localeCompare(b));
 
-  // Directories (sorted)
-  const dirNames = [...node.children.keys()].sort((a, b) => a.localeCompare(b))
-  for (const dirName of dirNames) {
-    const child = node.children.get(dirName)
-    const dirRelPath = parentPath ? `${parentPath}/${dirName}` : dirName
+  let html = "";
+  if (dirs.length || files.length) html += "<ul>\n";
 
-    html += `  <li class="dir"><span class="dirname">${escapeHtml(dirName)}/</span>\n`
-    html += renderNode(child, dirRelPath)
-    html += '  </li>\n'
+  for (const d of dirs) {
+    const p = basePath ? `${basePath}/${d.name}` : d.name;
+    html += `  <li class="dir"><span>${escapeHtml(d.name)}/</span>\n`;
+    html += renderNode(d, p);
+    html += "  </li>\n";
   }
 
-  // Files (sorted)
-  const fileNames = [...node.files].sort((a, b) => a.localeCompare(b))
-  for (const fileName of fileNames) {
-    const fileRelPath = parentPath ? `${parentPath}/${fileName}` : fileName
-    html += `  <li class="file"><a href="${encodeURI(fileRelPath)}">${escapeHtml(fileName)}</a></li>\n`
+  for (const f of files) {
+    const p = basePath ? `${basePath}/${f}` : f;
+    const href = encodeURI(p);
+    html += `  <li class="file"><a href="${href}">${escapeHtml(f)}</a></li>\n`;
   }
 
-  html += '</ul>\n'
-  return html
+  if (dirs.length || files.length) html += "</ul>\n";
+  return html;
 }
 
-// ----- 4. Assemble full HTML page and write it -----
-
-function wrapPage(bodyHtml) {
-  return `<!DOCTYPE html>
+function wrapPage(inner) {
+  return `<!doctype html>
 <html lang="en">
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Table of Contents</title>
 <style>
-  :root {
-    color-scheme: light dark;
-    --bg: #fff;
-    --fg: #000;
-    --dir: #2563eb;
-    --file: inherit;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f172a;
-      --fg: #f8fafc;
-      --dir: #60a5fa;
-    }
-  }
-
-  body {
-    background: var(--bg);
-    color: var(--fg);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-                 Roboto, "Helvetica Neue", sans-serif;
-    line-height: 1.5;
-    padding: 2rem;
-    max-width: 60rem;
-  }
-
-  h1 {
-    font-size: 1.25rem;
-    font-weight: 600;
-    margin-bottom: 1rem;
-  }
-
-  ul {
-    list-style-type: none;
-    padding-left: 1rem;
-    margin: 0.25rem 0;
-    border-left: 1px solid color-mix(in srgb, var(--fg) 20%, transparent);
-  }
-  li {
-    margin: 0.25rem 0;
-  }
-  .dir > .dirname {
-    color: var(--dir);
-    font-weight: 600;
-  }
-  .file > a {
-    color: var(--file);
-    text-decoration: none;
-  }
-  .file > a:hover {
-    text-decoration: underline;
-  }
-
-  footer {
-    margin-top: 2rem;
-    font-size: .8rem;
-    opacity: .7;
-  }
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+  h1 { margin-top: 0; font-size: 1.25rem; }
+  ul { list-style: none; padding-left: 1rem; margin: 0.25rem 0; }
+  li { margin: 0.15rem 0; }
+  .dir > span { font-weight: 600; }
+  a { text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  footer { margin-top: 2rem; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity: 0.7; }
 </style>
-
-<body>
 <h1>Table of Contents</h1>
-
-${bodyHtml}
-
-<footer>
-  Generated by generate-index.js on ${new Date().toISOString()}
-</footer>
-</body>
-</html>
-`
+${inner || "<p><em>(no files)</em></p>"}
+<footer>Generated by generate-toc ${VERSION}</footer>
+</html>`;
 }
 
+// ---------------- Main ----------------
 async function main() {
-  const tree = await buildTree('.')
-  const tocHtml = renderNode(tree, '')
-  const fullHtml = wrapPage(tocHtml)
+  const argv = parseArgs([...Deno.args]);
+  const rootDir = argv.root;
 
-  await Deno.writeTextFile('table-of-contents.html', fullHtml)
-  console.log('Wrote table-of-contents.html')
+  const compiledRules = loadExcludeRules({
+    noGlobal: argv.noGlobal,
+    rootDir,
+  });
+
+  const tree = await buildTree(rootDir, compiledRules);
+  const tocHtml = renderNode(tree, "");
+  const fullHtml = wrapPage(tocHtml);
+
+  await Deno.writeTextFile("table-of-contents.html", fullHtml);
+  console.log("Wrote table-of-contents.html");
 }
 
 if (import.meta.main) {
-  main()
+  await main();
 }

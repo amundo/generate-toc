@@ -1,0 +1,8 @@
+{
+    "fmt": {
+        "semiColons": false
+    },
+    "tasks": {
+        "install": "deno install --global --force --allow-write --allow-read generate-toc.js"
+    }
+}

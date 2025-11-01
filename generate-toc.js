@@ -16,9 +16,9 @@
 //  - Later rules override earlier ones
 //  - Prefix a rule with '!' to re-include (negate) a prior match
 
-import { join, relative, posix, globToRegExp } from "jsr:@std/path";
+import { join, relative, globToRegExp } from "jsr:@std/path";
 
-const VERSION = "v0.1.0";
+const VERSION = "v0.1.1";
 
 // ---------------- CLI ----------------
 function parseArgs(args) {
@@ -110,7 +110,7 @@ async function buildTree(rootDir, compiledRules) {
 
   async function walkDir(absDir, relDir) {
     for await (const entry of Deno.readDir(absDir)) {
-      const rel = relDir ? posix.join(relDir, entry.name) : entry.name;
+      const rel = relDir ? join(relDir, entry.name) : entry.name;
 
       // If excluded, skip completely (no descend)
       if (!isIncluded(rel, compiledRules)) continue;

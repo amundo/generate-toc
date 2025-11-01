@@ -3,6 +3,7 @@
         "semiColons": false
     },
     "tasks": {
-        "install": "deno install --global --force --allow-write --allow-read generate-toc.js"
+        "install": "deno install --allow-env --global --force --allow-write --allow-read generate-toc.js",
+        "build": "pandoc -s README.md -o README.html"
     }
 }
